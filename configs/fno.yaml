@@ -1,0 +1,34 @@
+log_dir: outputs/fno
+
+model:
+    in_time_window: 1
+    out_time_window: 20
+    in_channels: 4
+    out_channels: 4
+    n_modes: [64, 64]
+    hidden_channels: 64
+    data_loss_weight: 1
+    fno_kwargs:
+        n_layers: 8
+
+data:
+    data_folder: './data/'
+    train_data_files:
+      - train_data.npy
+    test_data_files:
+      - test_data.npy
+    nx: 128
+    ny: 64
+    stride: 1
+    subsample_rate: 10
+    normalize: True
+
+training:
+    epochs: 100
+    lr: 0.001
+    batch_size: 16
+    warmup_epochs: 10
+    warmup_start_factor: 0.001
+    min_lr: 1.0e-6
+    scheduler_step: 5
+    scheduler_gamma: 0.7

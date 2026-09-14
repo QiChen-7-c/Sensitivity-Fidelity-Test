@@ -1,0 +1,7 @@
+torch
+numpy
+pyyaml
+matplotlib
+h5py
+einops
+neuraloperator

@@ -1,0 +1,52 @@
+log_dir: outputs/swin
+
+model:
+    name: swin_hierarchical
+    in_channels: 4
+    out_channels: 4
+    in_time_window: 1
+    out_time_window: 20
+    hidden_size: 64
+    patch_size: 2
+    depths: [2, 2, 4, 2]
+    decoder_depths: [2, 2, 2]
+    num_heads: [4, 8, 16, 32]
+    window_sizes: [[8, 4], [8, 4], [4, 4], [4, 4]]
+    mlp_ratio: 4.0
+    qkv_bias: true
+    patch_norm: true
+    full_pos_embed: true
+    drop_rate: 0.0
+    attn_drop_rate: 0.0
+    drop_path_rate: 0.1
+    activation_checkpointing: false
+    coord_embed: true
+    predict_delta: true
+    use_global_mixer: true
+    global_mixer_every: 2
+    global_modes: [16, 16]
+    layer_scale_init: 0.001
+    data_loss_weight: 1
+    swin_kwargs: {}
+
+data:
+    data_folder: './data/'
+    train_data_files:
+      - train_data.npy
+    test_data_files:
+      - test_data.npy
+    nx: 128
+    ny: 64
+    stride: 1
+    subsample_rate: 10
+    normalize: True
+
+training:
+    epochs: 100
+    lr: 0.001
+    batch_size: 16
+    warmup_epochs: 10
+    warmup_start_factor: 0.001
+    min_lr: 1.0e-6
+    scheduler_step: 5
+    scheduler_gamma: 0.7

@@ -1,0 +1,38 @@
+log_dir: outputs/ifactformer
+
+model:
+    in_dim: 4
+    out_dim: 4
+    in_time_window: 1
+    out_time_window: 20
+    dim: 64
+    heads: 8
+    depth: 1
+    dim_head: 64
+    n_layer: 4
+    model: IFactFormer_m
+    data_loss_weight: 1
+
+data:
+    data_folder: './data/'
+    train_data_files:
+      - train_data.npy
+    test_data_files:
+      - test_data.npy
+    nx: 128
+    ny: 64
+    stride: 1
+    subsample_rate: 10
+    normalize: True
+
+
+
+training:   
+    epochs: 100
+    lr: 0.001
+    batch_size: 16
+    warmup_epochs: 10
+    warmup_start_factor: 0.001
+    min_lr: 1.0e-6
+    scheduler_step: 5
+    scheduler_gamma: 0.7
