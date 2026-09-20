@@ -3,12 +3,6 @@ import json
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import TwoSlopeNorm
-from matplotlib.patches import Rectangle
 import numpy as np
 import torch
 import yaml
@@ -96,28 +90,12 @@ def parse_args() -> Tuple[argparse.Namespace, dict]:
         help="Optional ROI start index along y (overrides automatic centering).",
     )
     parser.add_argument(
-        "--viz-interval",
-        type=int,
-        default=1,
-        help="Visualization interval in steps (plot one frame every N steps).",
-    )
-    parser.add_argument(
         "--physical-io",
         action="store_true",
         help=(
             "Use physical (denormalized) input/output tensors in the sensitivity "
             "graph while keeping the model rollout in normalized space. "
             "Equivalent to the former sensitivity_test.py behavior."
-        ),
-    )
-    parser.add_argument(
-        "--adjoint-path",
-        type=Path,
-        default=Path("./data/adjoint_1e-2_1000_r5e4.npz"),
-        help=(
-            "Path to adjoint NPZ used for gradient comparison. If the default "
-            "relative path is missing, the script also tries "
-            "data/<filename>."
         ),
     )
     args, unknown = parser.parse_known_args()
@@ -520,7 +498,7 @@ def build_rollout_times(
     pred_end = pred_start + predict_steps
     if input_end > all_times.shape[0] or pred_end > all_times.shape[0]:
         raise ValueError(
-            "Time coordinates do not cover the requested visualization window: "
+            "Time coordinates do not cover the requested rollout window: "
             f"input [{input_start}:{input_end}), pred [{pred_start}:{pred_end}), "
             f"available={all_times.shape[0]}."
         )
@@ -545,30 +523,6 @@ def build_rollout_labels(
     return labels
 
 
-def cheb_nodes(n: int, a: float = 0.0, b: float = 1.0) -> np.ndarray:
-    if n < 2:
-        return np.asarray([a], dtype=np.float64)
-    k = np.arange(n)
-    x = np.cos(np.pi * k / (n - 1))
-    return (b - a) * (x + 1.0) / 2.0 + a
-
-
-def build_adjoint_coords(nx: int, nz: int, lx: float = 3.0, lz: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    x = np.linspace(0.0, lx, nx, endpoint=False, dtype=np.float64)
-    z = cheb_nodes(nz, 0.0, lz)
-    return x, z
-
-
-def clip_vector_magnitude(u: np.ndarray, v: np.ndarray, max_magnitude: float) -> Tuple[np.ndarray, np.ndarray]:
-    if max_magnitude <= 0:
-        return np.zeros_like(u), np.zeros_like(v)
-    magnitude = np.sqrt(u**2 + v**2)
-    scale = np.ones_like(magnitude)
-    mask = magnitude > max_magnitude
-    scale[mask] = max_magnitude / (magnitude[mask] + 1e-12)
-    return u * scale, v * scale
-
-
 def roi_bounds_from_coords(
     x_coords: np.ndarray,
     y_coords: np.ndarray,
@@ -587,387 +541,6 @@ def roi_bounds_from_coords(
     )
 
 
-def flip_roi_bounds_vertical(
-    roi_bounds: Tuple[float, float, float, float],
-    y_coords: np.ndarray,
-) -> Tuple[float, float, float, float]:
-    x0, x1, y0, y1 = [float(v) for v in roi_bounds]
-    y_min = float(np.min(y_coords))
-    y_max = float(np.max(y_coords))
-    y_low, y_high = sorted((y0, y1))
-    return x0, x1, y_min + y_max - y_high, y_min + y_max - y_low
-
-
-def flip_roi_indices_vertical(
-    roi_bounds: Tuple[int, int, int, int],
-    ny: int,
-) -> Tuple[int, int, int, int]:
-    x0, x1, y0, y1 = [int(v) for v in roi_bounds]
-    return x0, x1, ny - y1, ny - y0
-
-
-def resolve_adjoint_path(adjoint_path: Path) -> Path:
-    """Resolve an adjoint file from the working directory or this project."""
-    if adjoint_path.is_absolute() and adjoint_path.exists():
-        return adjoint_path
-    candidates = [Path.cwd() / adjoint_path, Path(__file__).resolve().parent / adjoint_path]
-    for candidate in candidates:
-        candidate = candidate.resolve()
-        if candidate.exists():
-            return candidate
-    candidate_text = "\n".join(f"  - {candidate.resolve()}" for candidate in candidates)
-    raise FileNotFoundError(f"Adjoint NPZ not found. Tried:\n{candidate_text}")
-
-def load_adjoint_gradient_data(
-    adjoint_path: Path,
-) -> Tuple[np.ndarray, np.ndarray, List[str], Optional[Tuple[float, float, float, float]], Path]:
-    resolved_path = resolve_adjoint_path(adjoint_path)
-    payload = np.load(resolved_path)
-    required_keys = ["grad_b", "grad_u_x", "grad_u_z", "times", "steps"]
-    missing_keys = [key for key in required_keys if key not in payload]
-    if missing_keys:
-        raise KeyError(
-            f"Adjoint NPZ {resolved_path} is missing required keys: {missing_keys}"
-        )
-
-    grad_data = np.stack(
-        [payload["grad_b"], payload["grad_u_x"], payload["grad_u_z"]],
-        axis=-1,
-    ).astype(np.float32, copy=False)
-    grad_times = np.asarray(payload["times"], dtype=np.float64)
-    grad_steps = np.asarray(payload["steps"])
-    step_labels = [f"Adjoint Step {int(step)}" for step in grad_steps.tolist()]
-    roi_bounds = None
-    if "roi_bounds" in payload:
-        roi_bounds_arr = np.asarray(payload["roi_bounds"], dtype=np.float64)
-        if roi_bounds_arr.shape == (4,):
-            roi_bounds = tuple(float(v) for v in roi_bounds_arr.tolist())
-    return grad_data, grad_times, step_labels, roi_bounds, resolved_path
-
-
-def plot_grad_pred(
-    data,
-    nx,
-    ny,
-    step_labels,
-    times,
-    dir,
-    output_prefix,
-    roi_bounds,
-    type='grad',
-    ind=0,
-    viz_interval=1,
-    temp_absmax_override: Optional[float] = None,
-    invert_vertical: bool = False,
-    x_coords: Optional[np.ndarray] = None,
-    y_coords: Optional[np.ndarray] = None,
-    transpose_fields: bool = True,
-    roi_bounds_are_indices: bool = True,
-):
-    if viz_interval <= 0:
-        raise ValueError(f"viz_interval must be > 0, got {viz_interval}.")
-
-    temp = data[..., 0]
-    u = data[..., 1]
-    v = data[..., 2]
-
-    if temp.shape[0] == 0:
-        return
-
-    sampled_indices = list(range(0, temp.shape[0], viz_interval))
-    if not sampled_indices:
-        return
-
-    if temp_absmax_override is not None:
-        temp_absmax = float(temp_absmax_override)
-    else:
-        temp_absmax = float(np.abs(temp).max())
-    if temp_absmax <= 0:
-        temp_absmax = 1e-8
-
-    uv_magnitude = np.sqrt(u**2 + v**2)
-    uv_absmax = float(uv_magnitude.max())
-    if uv_absmax <= 0:
-        uv_absmax = 1e-8
-    quiver_scale = uv_absmax / 3.0
-    # quiver_scale = 5e-3
-
-
-    if x_coords is None:
-        x_coords = np.arange(nx)
-    if y_coords is None:
-        y_coords = np.arange(ny)
-    if type == 'adjoint' and invert_vertical:
-        if roi_bounds_are_indices:
-            roi_bounds = flip_roi_indices_vertical(roi_bounds, ny)
-        else:
-            roi_bounds = flip_roi_bounds_vertical(roi_bounds, y_coords)
-    roi_x_start, roi_x_end, roi_y_start, roi_y_end = roi_bounds
-    roi_width = roi_x_end - roi_x_start
-    roi_height = roi_y_end - roi_y_start
-
-    mesh_indexing = "xy" if transpose_fields else "ij"
-    X, Y = np.meshgrid(x_coords, y_coords, indexing=mesh_indexing)
-
-    stride_y_grad = 4
-    stride_x_grad = 4
-    stride_y = 4
-    stride_x = 4
-    rows, cols = 4, 5
-    plots_per_figure = rows * cols
-
-    for fig_idx, start in enumerate(range(0, len(sampled_indices), plots_per_figure), start=1):
-        figure_indices = sampled_indices[start : start + plots_per_figure]
-        fig, axes = plt.subplots(
-            rows,
-            cols,
-            figsize=(21, 8),
-            constrained_layout=True,
-            squeeze=False,
-            sharex=True,
-            sharey=True,
-        )
-        axes = np.atleast_1d(axes).ravel()
-        contour_ref = None
-
-        for panel_idx, ax in enumerate(axes):
-            if panel_idx >= len(figure_indices):
-                ax.axis("off")
-                continue
-
-            step_idx = figure_indices[panel_idx]
-            if transpose_fields:
-                temp_field = temp[step_idx].T
-                u_field = u[step_idx].T
-                v_field = v[step_idx].T
-            else:
-                temp_field = temp[step_idx]
-                u_field = u[step_idx]
-                v_field = v[step_idx]
-            norm = TwoSlopeNorm(vmin=-temp_absmax, vcenter=0.0, vmax=temp_absmax)
-            if type in {'grad', 'adjoint'}:
-                contour_ref = ax.contourf(
-                    X,
-                    Y,
-                    temp_field,
-                    levels=np.linspace(-temp_absmax, temp_absmax, 20),
-                    cmap="coolwarm",
-                    norm=norm,
-                )
-                if type == 'adjoint':
-                    u_field, v_field = clip_vector_magnitude(u_field, v_field, uv_absmax)
-                ax.quiver(
-                    X[::stride_y_grad, ::stride_x_grad],
-                    Y[::stride_y_grad, ::stride_x_grad],
-                    u_field[::stride_y_grad, ::stride_x_grad],
-                    v_field[::stride_y_grad, ::stride_x_grad],
-                    # angles="xy",
-                    # scale_units="xy",
-                    # scale=1e-4,
-                    color="k",
-                    scale=8e-2 if type == 'adjoint' else 5e-2,
-                    width=0.003,
-                )
-            else:
-                contour_ref = ax.contourf(
-                    X,
-                    Y,
-                    temp_field,
-                    levels=20,
-                    cmap="coolwarm",
-                )
-                ax.quiver(
-                    X[::stride_y, ::stride_x],
-                    Y[::stride_y, ::stride_x],
-                    u_field[::stride_y, ::stride_x],
-                    v_field[::stride_y, ::stride_x],
-                    angles="xy",
-                    scale_units="xy",
-                    scale=quiver_scale * 0.5,
-                    width=0.003,
-                )
-
-            roi_rect = Rectangle(
-                (
-                    roi_x_start - 0.5 if roi_bounds_are_indices else roi_x_start,
-                    roi_y_start - 0.5 if roi_bounds_are_indices else roi_y_start,
-                ),
-                roi_width,
-                roi_height,
-                linewidth=1.5,
-                edgecolor="orange" if type == 'adjoint' and not roi_bounds_are_indices else "black",
-                facecolor="none",
-            )
-            ax.add_patch(roi_rect)
-
-            if step_idx < len(step_labels):
-                title = step_labels[step_idx]
-            else:
-                title = f"Step {step_idx + 1}"
-            if times is not None and step_idx < len(times):
-                title += f"\nt={times[step_idx]:.3f}"
-            ax.set_title(title, fontsize=8)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.set_aspect("equal")
-
-        if invert_vertical and axes.size > 0:
-            # Match the adjoint plotting reference --invert-z.
-            axes[0].invert_yaxis()
-
-        if contour_ref is not None:
-            cbar = fig.colorbar(contour_ref, ax=list(axes), fraction=0.04, pad=0.02)
-            if type == 'grad':
-                cbar.set_label("Gradient of T")
-            elif type == 'adjoint':
-                cbar.set_label("Adjoint Gradient of T")
-            elif type == 'true':
-                cbar.set_label("True T")
-            else:
-                cbar.set_label("Predicted T")
-
-        if type == 'grad':
-            figure_path = dir / f"{output_prefix}_gradient_interval{viz_interval}_part{fig_idx}_{ind}.png"
-        elif type == 'adjoint':
-            figure_path = dir / f"{output_prefix}_adjoint_gradient_interval{viz_interval}_part{fig_idx}_{ind}.png"
-        elif type == 'true':
-            figure_path = dir / f"{output_prefix}_true_interval{viz_interval}_part{fig_idx}_{ind}.png"
-        else:
-            figure_path = dir / f"{output_prefix}_predicted_interval{viz_interval}_part{fig_idx}_{ind}.png"
-        fig.savefig(figure_path, dpi=1000)
-        plt.close(fig)
-
-
-def plot_pred_true_compare(
-    pred_data,
-    label_data,
-    nx,
-    ny,
-    state_times,
-    output_dir,
-    output_prefix,
-    ind=0,
-    steps_per_figure=10,
-):
-    temp_pred = pred_data[..., 0]
-    u_pred = pred_data[..., 1]
-    v_pred = pred_data[..., 2]
-
-    temp_label = label_data[..., 0]
-    u_label = label_data[..., 1]
-    v_label = label_data[..., 2]
-
-    total_steps = min(temp_label.shape[0], temp_pred.shape[0])
-    if total_steps == 0:
-        return
-
-    temp_min = float(min(temp_label[:total_steps].min(), temp_pred[:total_steps].min()))
-    temp_max = float(max(temp_label[:total_steps].max(), temp_pred[:total_steps].max()))
-    if np.isclose(temp_min, temp_max):
-        delta = 1e-8 if temp_min == 0 else abs(temp_min) * 1e-6
-        temp_min -= delta
-        temp_max += delta
-    temp_levels = np.linspace(temp_min, temp_max, 20)
-
-    uv_label_mag = np.sqrt(u_label[:total_steps] ** 2 + v_label[:total_steps] ** 2)
-    uv_pred_mag = np.sqrt(u_pred[:total_steps] ** 2 + v_pred[:total_steps] ** 2)
-    uv_absmax = float(max(uv_label_mag.max(), uv_pred_mag.max()))
-    if uv_absmax <= 0:
-        uv_absmax = 1e-8
-    quiver_scale = uv_absmax / 8.0
-
-    x_coords = np.arange(nx)
-    y_coords = np.arange(ny)
-    X, Y = np.meshgrid(x_coords, y_coords, indexing="xy")
-
-    stride_y = 4
-    stride_x = 4
-
-    for fig_idx, start_offset in enumerate(range(0, total_steps, steps_per_figure), start=1):
-        time_steps = min(steps_per_figure, total_steps - start_offset)
-        fig, axes = plt.subplots(
-            2,
-            steps_per_figure,
-            figsize=(30, 8),
-            constrained_layout=True,
-            squeeze=False,
-        )
-        contour_ref = None
-
-        for step in range(time_steps):
-            ax_label = axes[0, step]
-            ax_pred = axes[1, step]
-            num_step = start_offset + step
-
-            contour_ref = ax_label.contourf(
-                X,
-                Y,
-                temp_label[num_step].T,
-                levels=temp_levels,
-                cmap="coolwarm",
-            )
-            ax_label.quiver(
-                X[::stride_y, ::stride_x],
-                Y[::stride_y, ::stride_x],
-                u_label[num_step].T[::stride_y, ::stride_x],
-                v_label[num_step].T[::stride_y, ::stride_x],
-                angles="xy",
-                scale_units="xy",
-                scale=quiver_scale,
-                width=0.003,
-            )
-            label_title = f"Label Step {num_step + 1}"
-            if num_step < len(state_times):
-                label_title += f"\nt={state_times[num_step]:.3f}"
-            ax_label.set_title(label_title, fontsize=10)
-            ax_label.set_xticks([])
-            ax_label.set_yticks([])
-            ax_label.set_aspect("equal")
-
-            ax_pred.contourf(
-                X,
-                Y,
-                temp_pred[num_step].T,
-                levels=temp_levels,
-                cmap="coolwarm",
-            )
-            ax_pred.quiver(
-                X[::stride_y, ::stride_x],
-                Y[::stride_y, ::stride_x],
-                u_pred[num_step].T[::stride_y, ::stride_x],
-                v_pred[num_step].T[::stride_y, ::stride_x],
-                angles="xy",
-                scale_units="xy",
-                scale=quiver_scale,
-                width=0.003,
-            )
-            pred_title = f"Prediction Step {num_step + 1}"
-            if num_step < len(state_times):
-                pred_title += f"\nt={state_times[num_step]:.3f}"
-            ax_pred.set_title(pred_title, fontsize=10)
-            ax_pred.set_xticks([])
-            ax_pred.set_yticks([])
-            ax_pred.set_aspect("equal")
-
-        for col in range(time_steps, steps_per_figure):
-            axes[0, col].axis("off")
-            axes[1, col].axis("off")
-
-        if contour_ref is not None:
-            cbar = fig.colorbar(
-                contour_ref,
-                ax=axes.ravel().tolist(),
-                fraction=0.06,
-                pad=0.02,
-            )
-            cbar.set_label("Temperature (T)")
-
-        output_path = output_dir / f"{output_prefix}_pred_true_compare_part{fig_idx}_{ind}.png"
-        fig.savefig(output_path, dpi=300)
-        plt.close(fig)
-        print(f"Prediction visualization saved to {output_path}")
-
-
 def main() -> None:
     args, overrides = parse_args()
     set_random_seed(args.seed)
@@ -984,8 +557,6 @@ def main() -> None:
             f"Overriding config.model.out_time_window: "
             f"{original_out_time_window} -> {config.model.out_time_window}"
         )
-    if args.viz_interval <= 0:
-        raise ValueError(f"viz_interval must be > 0, got {args.viz_interval}.")
     model_type = infer_model_type(config, args.model_type)
 
     target_step = args.target_step if args.target_step is not None else config.model.out_time_window - 1
@@ -1083,22 +654,9 @@ def main() -> None:
     model = build_model(config, model_type).to(device)
     load_state_dict_flexible(model, state_dict)
     model.eval()
-    adjoint_grad_data, adjoint_grad_times, adjoint_step_labels, adjoint_roi_bounds, adjoint_path = load_adjoint_gradient_data(
-        args.adjoint_path
-    )
-    adjoint_temp_absmax = float(np.abs(adjoint_grad_data[..., 0]).max())
-    if adjoint_temp_absmax <= 0:
-        adjoint_temp_absmax = 1e-8
-    adjoint_x_coords, adjoint_z_coords = build_adjoint_coords(
-        adjoint_grad_data.shape[1],
-        adjoint_grad_data.shape[2],
-    )
-
     print(f"Loaded checkpoint from {checkpoint_path}")
     print(f"Model type: {model_type}")
     print(f"Model params: {count_params(model)}")
-    print(f"Loaded adjoint comparison from {adjoint_path}")
-    print(f"Adjoint temperature gradient absmax: {adjoint_temp_absmax:.6e}")
 
     predict_steps = config.model.out_time_window
     input_times, pred_times, state_times = build_rollout_times(
@@ -1216,53 +774,9 @@ def main() -> None:
         gradient_stack = torch.stack(grad_frames, dim=1)
         gradients_np = gradient_stack[0].detach().cpu().numpy()
 
-        plot_grad_pred(
-            gradients_np,
-            nx,
-            ny,
-            step_labels,
-            np.asarray(grad_times, dtype=np.float64),
-            load_dir,
-            output_prefix,
-            model_roi_bounds_physical,
-            type='grad',
-            ind=args.sample_index,
-            viz_interval=args.viz_interval,
-            temp_absmax_override=adjoint_temp_absmax,
-            x_coords=model_x_coords,
-            y_coords=model_y_coords,
-            transpose_fields=True,
-            roi_bounds_are_indices=False,
-        )
-        print(
-            "Physical-gradient visualization completed."
-            if args.physical_io
-            else "Gradient visualization completed."
-        )
     else:
-        print("No gradients captured for visualization.")
+        print("No gradients captured.")
         gradients_np = np.empty((0, nx, ny, input_clip.shape[-1]), dtype=np.float32)
-
-    plot_grad_pred(
-        adjoint_grad_data,
-        adjoint_grad_data.shape[1],
-        adjoint_grad_data.shape[2],
-        adjoint_step_labels,
-        adjoint_grad_times,
-        load_dir,
-        output_prefix,
-        adjoint_roi_bounds if adjoint_roi_bounds is not None else model_roi_bounds_physical,
-        type='adjoint',
-        ind=args.sample_index,
-        viz_interval=10,
-        temp_absmax_override=adjoint_temp_absmax,
-        invert_vertical=True,
-        x_coords=adjoint_x_coords,
-        y_coords=adjoint_z_coords,
-        transpose_fields=False,
-        roi_bounds_are_indices=False,
-    )
-    print("Adjoint-gradient visualization completed.")
 
     with torch.no_grad():
         predict_future = torch.cat([frame.detach() for frame in pred_sequence], dim=1)
@@ -1277,52 +791,9 @@ def main() -> None:
             predict_full = dataset.denormalize_grid(predict_full)
             label_full = dataset.denormalize_grid(label_full)
     
-    print(f"Prediction visualization")
-
     predictions_np = predict_full[0].detach().cpu().numpy()
     label_full_np = label_full[0].detach().cpu().numpy()
 
-    plot_grad_pred(
-        predictions_np,
-        nx,
-        ny,
-        state_step_labels,
-        state_times,
-        load_dir,
-        output_prefix,
-        (roi_x_start, roi_x_end, roi_y_start, roi_y_end),
-        type='pred',
-        ind=args.sample_index,
-        viz_interval=args.viz_interval,
-    )
-    print(f"Prediction visualization completed.")
-
-    plot_grad_pred(
-        label_full_np,
-        nx,
-        ny,
-        state_step_labels,
-        state_times,
-        load_dir,
-        output_prefix,
-        (roi_x_start, roi_x_end, roi_y_start, roi_y_end),
-        type='true',
-        ind=args.sample_index,
-        viz_interval=args.viz_interval,
-    )
-    print("Ground-truth visualization completed.")
-
-    plot_pred_true_compare(
-        predictions_np,
-        label_full_np,
-        nx,
-        ny,
-        state_times,
-        load_dir,
-        output_prefix,
-        ind=args.sample_index,
-        steps_per_figure=10,
-    )
     input_count = int(config.model.in_time_window)
     sensitivity_space = "physical" if args.physical_io else "normalized"
     save_analysis_artifacts(
@@ -1356,9 +827,6 @@ def main() -> None:
         physical_io=args.physical_io,
     )
     print("Analysis arrays and metadata saved.")
-
-    
-        
 
 
 if __name__ == "__main__":

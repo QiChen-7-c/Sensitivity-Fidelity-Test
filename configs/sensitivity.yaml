@@ -1,4 +1,4 @@
-# Defaults for sensitivity.py. Checkpoint and adjoint paths may be overridden on the CLI.
+# Defaults for sensitivity.py. Checkpoint paths may be overridden on the CLI.
 model_type: auto
 load_dir: outputs/ifactformer
 checkpoint: checkpoint_best.pt
@@ -9,5 +9,3 @@ target_step: null
 out_time_window: 20
 roi_size: 8
 physical_io: true
-viz_interval: 1
-adjoint_path: ./data/adjoint_1e-2_1000_r5e4.npz
